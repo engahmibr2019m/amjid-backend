@@ -1,15 +1,15 @@
 'use strict';
 /**
- * خادم موقع أمجد + تسجيل دخول الأدمن الوحيد (بدون أي مكتبات خارجية)
+ * خادم موقع أمجد + حساب أدمن واحد (بدون أي مكتبات خارجية)
  *
  * التشغيل:
  *   node server.js
  *   ثم افتح:  http://localhost:8080/
  *
- * بيانات الحساب الوحيد — طريقتان:
- *   1) غيّر القيمتين التاليتين مباشرة هنا
- *   2) أو عبر متغيرات البيئة:
- *      ADMIN_USER=مستخدمك ADMIN_PASS=كلمتك PORT=8080 node server.js
+ * للنشر على Vercel:
+ *   أضف متغيرات البيئة في Vercel:
+ *   - ADMIN_PASSWORD: كلمة مرور الأدمن
+ *   - CARDS_DATA: بيانات الكروت (JSON string)
  *
  * endpoints:
  *   POST /api/login   {username,password} → كوكي جلسة HttpOnly
@@ -22,18 +22,48 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
-const HOME_PAGE = 'amgad (2).html';           // الصفحة الوحيدة
+const ACCOUNT_FILE = path.join(__dirname, '.admin-account.json');
+const HOME_PAGE = 'index.html';                // الصفحة الوحيدة
 const SESSION_COOKIE = 'amgad_session';
 const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;  // 7 أيام
 const MAX_BODY = 16 * 1024;                  // أقصى حجم لطلب (الدخول أو إضافة كارت)
 const RATE_LIMIT = 5;                         // محاولات خاطئة قبل التجميد
-const RATE_WINDOW = 15 * 60 * 1000;           // 15 دقيقة
+const RATE_WINDOW = 24 * 60 * 60 * 1000;      // 24 ساعة (يوم واحد)
 
 const ROOT = __dirname;
 const sessions = new Map();                   // توكن -> { user, expires }
 const attempts = new Map();                   // ip -> { n, until }
+
+function loadAdminAccount() {
+  // إذا كانت هناك كلمة مرور في environment variables (لـ Vercel)
+  if (process.env.ADMIN_PASSWORD) {
+    const password = process.env.ADMIN_PASSWORD;
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+    const account = { username: 'admin', salt, hash };
+    console.log('\n  استخدام كلمة مرور الأدمن من environment variables');
+    return account;
+  }
+
+  // استخدام ملف محلي للتطوير
+  try {
+    const account = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf8'));
+    if (account.username === 'admin' && /^[a-f0-9]{32}$/.test(account.salt) && /^[a-f0-9]{128}$/.test(account.hash)) return account;
+    throw new Error('invalid account file');
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw new Error('ملف حساب الأدمن غير صالح: ' + ACCOUNT_FILE);
+    const password = crypto.randomBytes(18).toString('base64url');
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+    const account = { username: 'admin', salt, hash };
+    fs.writeFileSync(ACCOUNT_FILE, JSON.stringify(account, null, 2), { encoding: 'utf8', flag: 'wx' });
+    console.log('\n  تم إنشاء حساب الأدمن الوحيد:');
+    console.log('  اسم المستخدم: admin');
+    console.log('  كلمة المرور (احفظها الآن): ' + password + '\n');
+    return account;
+  }
+}
+const ADMIN_ACCOUNT = loadAdminAccount();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -53,10 +83,15 @@ function send(res, code, body, headers) {
 
 function json(res, code, obj, extra) {
   const body = JSON.stringify(obj);
+  const origin = extra && extra.origin ? extra.origin : '*';
   send(res, code, body, Object.assign({
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff'
+    'X-Content-Type-Options': 'nosniff',
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Credentials': 'true'
   }, extra || {}));
 }
 
@@ -123,6 +158,17 @@ function pruneSessions() {
 const CARDS_FILE = path.join(ROOT, 'cards.json');
 
 function readCards() {
+  // محاولة قراءة من environment variables (لـ Vercel)
+  if (process.env.CARDS_DATA) {
+    try {
+      const arr = JSON.parse(process.env.CARDS_DATA);
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) {
+      console.error('خطأ في قراءة CARDS_DATA من environment:', e);
+    }
+  }
+
+  // استخدام ملف محلي للتطوير
   try {
     const arr = JSON.parse(fs.readFileSync(CARDS_FILE, 'utf8'));
     return Array.isArray(arr) ? arr : [];
@@ -131,24 +177,29 @@ function readCards() {
   }
 }
 function writeCards(cards) {
+  // في Vercel، لا يمكن كتابة إلى ملفات، لذا نطبع تحذير
+  if (process.env.VERCEL) {
+    console.warn('لا يمكن حفظ الكروت على Vercel بدون قاعدة بيانات. يجب استخدام متغير CARDS_DATA.');
+    return;
+  }
   fs.writeFileSync(CARDS_FILE, JSON.stringify(cards, null, 2), 'utf8');
 }
 function isValidUrl(u) {
   return typeof u === 'string' && u.length <= 2048 && /^https?:\/\/\S+$/i.test(u);
 }
-async function handleAddCard(req, res) {
-  if (!currentSession(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+async function handleAddCard(req, res, origin) {
+  if (!currentSession(req)) return json(res, 401, { ok: false, error: 'unauthorized' }, { origin });
   let data;
   try {
     data = JSON.parse(await readBody(req));
   } catch (e) {
-    return json(res, 400, { ok: false, error: 'bad_request' });
+    return json(res, 400, { ok: false, error: 'bad_request' }, { origin });
   }
   const n = Number(data.n);
   const img = typeof data.img === 'string' ? data.img.trim() : '';
   const video = typeof data.video === 'string' ? data.video.trim() : '';
   if (!Number.isInteger(n) || n < 1 || n > 9999 || !isValidUrl(img) || !isValidUrl(video)) {
-    return json(res, 400, { ok: false, error: 'invalid' });
+    return json(res, 400, { ok: false, error: 'invalid' }, { origin });
   }
   const cards = readCards().filter(c => c.n !== n);      // نفس الرقم = استبدال
   cards.push({ n: n, img: img, video: video, addedAt: new Date().toISOString() });
@@ -156,53 +207,105 @@ async function handleAddCard(req, res) {
   try {
     writeCards(cards);
   } catch (e) {
-    return json(res, 500, { ok: false, error: 'write_failed' });
+    return json(res, 500, { ok: false, error: 'write_failed' }, { origin });
   }
-  return json(res, 200, { ok: true, cards: cards });
+  return json(res, 200, { ok: true, cards: cards }, { origin });
+}
+
+async function handleUpdateCard(req, res, cardNum, origin) {
+  if (!currentSession(req)) return json(res, 401, { ok: false, error: 'unauthorized' }, { origin });
+  let data;
+  try {
+    data = JSON.parse(await readBody(req));
+  } catch (e) {
+    return json(res, 400, { ok: false, error: 'bad_request' }, { origin });
+  }
+  const n = Number(cardNum);
+  const img = typeof data.img === 'string' ? data.img.trim() : '';
+  const video = typeof data.video === 'string' ? data.video.trim() : '';
+  if (!Number.isInteger(n) || n < 1 || n > 9999 || !isValidUrl(img) || !isValidUrl(video)) {
+    return json(res, 400, { ok: false, error: 'invalid' }, { origin });
+  }
+  const cards = readCards();
+  const existingIndex = cards.findIndex(c => c.n === n);
+  if (existingIndex === -1) {
+    return json(res, 404, { ok: false, error: 'not_found' }, { origin });
+  }
+  cards[existingIndex] = { n: n, img: img, video: video, addedAt: cards[existingIndex].addedAt, updatedAt: new Date().toISOString() };
+  cards.sort((a, b) => a.n - b.n);
+  try {
+    writeCards(cards);
+  } catch (e) {
+    return json(res, 500, { ok: false, error: 'write_failed' }, { origin });
+  }
+  return json(res, 200, { ok: true, cards: cards }, { origin });
+}
+
+async function handleDeleteCard(req, res, cardNum, origin) {
+  if (!currentSession(req)) return json(res, 401, { ok: false, error: 'unauthorized' }, { origin });
+  const n = Number(cardNum);
+  if (!Number.isInteger(n) || n < 1 || n > 9999) {
+    return json(res, 400, { ok: false, error: 'invalid' }, { origin });
+  }
+  const cards = readCards();
+  const filteredCards = cards.filter(c => c.n !== n);
+  if (filteredCards.length === cards.length) {
+    return json(res, 404, { ok: false, error: 'not_found' }, { origin });
+  }
+  try {
+    writeCards(filteredCards);
+  } catch (e) {
+    return json(res, 500, { ok: false, error: 'write_failed' }, { origin });
+  }
+  return json(res, 200, { ok: true, cards: filteredCards }, { origin });
 }
 
 /* ---------- API ---------- */
-async function handleLogin(req, res) {
+async function handleLogin(req, res, origin) {
   const ip = req.socket.remoteAddress || 'unknown';
   if (!rateAllowed(ip)) {
-    return json(res, 429, { ok: false, error: 'too_many' });
+    return json(res, 429, { ok: false, error: 'too_many' }, { origin });
   }
   let data;
   try {
     data = JSON.parse(await readBody(req));
   } catch (e) {
-    return json(res, 400, { ok: false, error: 'bad_request' });
+    return json(res, 400, { ok: false, error: 'bad_request' }, { origin });
   }
   const username = typeof data.username === 'string' ? data.username : '';
   const password = typeof data.password === 'string' ? data.password : '';
-  const okUser = safeEqual(username, ADMIN_USER);
-  const okPass = safeEqual(password, ADMIN_PASS);
+  const okUser = safeEqual(username, ADMIN_ACCOUNT.username);
+  const candidate = crypto.scryptSync(password, ADMIN_ACCOUNT.salt, 64);
+  const expected = Buffer.from(ADMIN_ACCOUNT.hash, 'hex');
+  const okPass = crypto.timingSafeEqual(candidate, expected);
   const ok = okUser & okPass;               // و bitwise عشان يقارن الاتنين دائماً
   if (!ok) {
     rateHit(ip);
-    return json(res, 401, { ok: false, error: 'bad_credentials' });
+    return json(res, 401, { ok: false, error: 'bad_credentials' }, { origin });
   }
   rateReset(ip);
   pruneSessions();
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, { user: ADMIN_USER, expires: Date.now() + SESSION_TTL });
-  return json(res, 200, { ok: true, username: ADMIN_USER }, {
+  sessions.set(token, { user: ADMIN_ACCOUNT.username, expires: Date.now() + SESSION_TTL });
+  return json(res, 200, { ok: true, username: ADMIN_ACCOUNT.username }, {
     'Set-Cookie': SESSION_COOKIE + '=' + token +
-      '; HttpOnly; Path=/; SameSite=Lax; Max-Age=' + Math.floor(SESSION_TTL / 1000)
+      '; HttpOnly; Path=/; SameSite=None; Secure; Max-Age=' + Math.floor(SESSION_TTL / 1000),
+    'origin': origin
   });
 }
 
-function handleLogout(req, res) {
+function handleLogout(req, res, origin) {
   const token = parseCookies(req)[SESSION_COOKIE];
   if (token) sessions.delete(token);
   return json(res, 200, { ok: true }, {
-    'Set-Cookie': SESSION_COOKIE + '=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0'
+    'Set-Cookie': SESSION_COOKIE + '=; HttpOnly; Path=/; SameSite=None; Secure; Max-Age=0',
+    'origin': origin
   });
 }
 
-function handleMe(req, res) {
+function handleMe(req, res, origin) {
   const s = currentSession(req);
-  return json(res, 200, { authenticated: !!s, username: s ? s.user : null });
+  return json(res, 200, { authenticated: !!s, username: s ? s.user : null }, { origin });
 }
 
 /* ---------- الملفات الثابتة ---------- */
@@ -212,6 +315,11 @@ function serveStatic(req, res) {
     urlPath = decodeURIComponent(req.url.split('?')[0]);
   } catch (e) {
     return send(res, 400, 'Bad Request');
+  }
+  // ملفات الخادم والبيانات الداخلية لا تُعرض كملفات عامة.
+  if (urlPath.split('/').some(part => part.startsWith('.')) ||
+      ['/server.js', '/start-server.bat', '/cards.json'].includes(urlPath.toLowerCase())) {
+    return send(res, 404, 'Not Found');
   }
   if (urlPath === '/' ) urlPath = '/' + HOME_PAGE;
 
@@ -258,13 +366,38 @@ function serveStatic(req, res) {
 
 const server = http.createServer(async (req, res) => {
   try {
+    // معالجة CORS preflight
+    if (req.method === 'OPTIONS') {
+      const origin = req.headers.origin || '*';
+      res.writeHead(204, {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Credentials': 'true',
+        'Access-Control-Max-Age': '86400'
+      });
+      return res.end();
+    }
+
     const url = req.url.split('?')[0];
-    if (url === '/api/login' && req.method === 'POST') return await handleLogin(req, res);
-    if (url === '/api/logout' && req.method === 'POST') return handleLogout(req, res);
-    if (url === '/api/me' && req.method === 'GET') return handleMe(req, res);
-    if (url === '/api/cards' && req.method === 'GET') return json(res, 200, { ok: true, cards: readCards() });
-    if (url === '/api/cards' && req.method === 'POST') return await handleAddCard(req, res);
-    if (url.indexOf('/api/') === 0) return json(res, 404, { ok: false, error: 'not_found' });
+    const origin = req.headers.origin || '*';
+
+    if (url === '/api/login' && req.method === 'POST') return await handleLogin(req, res, origin);
+    if (url === '/api/logout' && req.method === 'POST') return handleLogout(req, res, origin);
+    if (url === '/api/me' && req.method === 'GET') return handleMe(req, res, origin);
+    if (url === '/api/cards' && req.method === 'GET') return json(res, 200, { ok: true, cards: readCards() }, { origin });
+    if (url === '/api/cards' && req.method === 'POST') return await handleAddCard(req, res, origin);
+    // PUT /api/cards/:num
+    if (url.startsWith('/api/cards/') && req.method === 'PUT') {
+      const cardNum = url.split('/').pop();
+      return await handleUpdateCard(req, res, cardNum, origin);
+    }
+    // DELETE /api/cards/:num
+    if (url.startsWith('/api/cards/') && req.method === 'DELETE') {
+      const cardNum = url.split('/').pop();
+      return await handleDeleteCard(req, res, cardNum, origin);
+    }
+    if (url.indexOf('/api/') === 0) return json(res, 404, { ok: false, error: 'not_found' }, { origin });
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       return send(res, 405, 'Method Not Allowed');
     }
@@ -274,7 +407,15 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log('✔ خادم أمجد شغّال على  http://localhost:' + PORT + '/');
-  console.log('  حساب الأدمن: ' + ADMIN_USER);
-});
+// تشغيل السيرفر محلياً
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log('✔ خادم أمجد شغّال على  http://localhost:' + PORT + '/');
+    console.log('  اسم حساب الأدمن: admin');
+  });
+}
+
+// للنشر على Vercel
+module.exports = (req, res) => {
+  server.emit('request', req, res);
+};
