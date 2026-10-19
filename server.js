@@ -1,13 +1,15 @@
 'use strict';
 /**
- * خادم موقع أمجد + حساب أدمن واحد (بدون أي مكتبات خارجية)
+ * خادم موقع أمجد + تسجيل دخول الأدمن الوحيد (بدون أي مكتبات خارجية)
  *
  * التشغيل:
  *   node server.js
  *   ثم افتح:  http://localhost:8080/
  *
- * عند أول تشغيل يُنشأ حساب admin بكلمة مرور عشوائية وتظهر في نافذة الخادم مرة واحدة.
- * يُحفظ تجزؤ كلمة المرور في .admin-account.json. لحساب جديد، احذف الملف وأعد التشغيل.
+ * بيانات الحساب الوحيد — طريقتان:
+ *   1) غيّر القيمتين التاليتين مباشرة هنا
+ *   2) أو عبر متغيرات البيئة:
+ *      ADMIN_USER=مستخدمك ADMIN_PASS=كلمتك PORT=8080 node server.js
  *
  * endpoints:
  *   POST /api/login   {username,password} → كوكي جلسة HttpOnly
@@ -20,7 +22,8 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const ACCOUNT_FILE = path.join(__dirname, '.admin-account.json');
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
 const HOME_PAGE = 'amgad (2).html';           // الصفحة الوحيدة
 const SESSION_COOKIE = 'amgad_session';
 const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;  // 7 أيام
@@ -31,26 +34,6 @@ const RATE_WINDOW = 15 * 60 * 1000;           // 15 دقيقة
 const ROOT = __dirname;
 const sessions = new Map();                   // توكن -> { user, expires }
 const attempts = new Map();                   // ip -> { n, until }
-
-function loadAdminAccount() {
-  try {
-    const account = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf8'));
-    if (account.username === 'admin' && /^[a-f0-9]{32}$/.test(account.salt) && /^[a-f0-9]{128}$/.test(account.hash)) return account;
-    throw new Error('invalid account file');
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw new Error('ملف حساب الأدمن غير صالح: ' + ACCOUNT_FILE);
-    const password = crypto.randomBytes(18).toString('base64url');
-    const salt = crypto.randomBytes(16).toString('hex');
-    const hash = crypto.scryptSync(password, salt, 64).toString('hex');
-    const account = { username: 'admin', salt, hash };
-    fs.writeFileSync(ACCOUNT_FILE, JSON.stringify(account, null, 2), { encoding: 'utf8', flag: 'wx' });
-    console.log('\n  تم إنشاء حساب الأدمن الوحيد:');
-    console.log('  اسم المستخدم: admin');
-    console.log('  كلمة المرور (احفظها الآن): ' + password + '\n');
-    return account;
-  }
-}
-const ADMIN_ACCOUNT = loadAdminAccount();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -192,10 +175,8 @@ async function handleLogin(req, res) {
   }
   const username = typeof data.username === 'string' ? data.username : '';
   const password = typeof data.password === 'string' ? data.password : '';
-  const okUser = safeEqual(username, ADMIN_ACCOUNT.username);
-  const candidate = crypto.scryptSync(password, ADMIN_ACCOUNT.salt, 64);
-  const expected = Buffer.from(ADMIN_ACCOUNT.hash, 'hex');
-  const okPass = crypto.timingSafeEqual(candidate, expected);
+  const okUser = safeEqual(username, ADMIN_USER);
+  const okPass = safeEqual(password, ADMIN_PASS);
   const ok = okUser & okPass;               // و bitwise عشان يقارن الاتنين دائماً
   if (!ok) {
     rateHit(ip);
@@ -204,8 +185,8 @@ async function handleLogin(req, res) {
   rateReset(ip);
   pruneSessions();
   const token = crypto.randomBytes(32).toString('hex');
-  sessions.set(token, { user: ADMIN_ACCOUNT.username, expires: Date.now() + SESSION_TTL });
-  return json(res, 200, { ok: true, username: ADMIN_ACCOUNT.username }, {
+  sessions.set(token, { user: ADMIN_USER, expires: Date.now() + SESSION_TTL });
+  return json(res, 200, { ok: true, username: ADMIN_USER }, {
     'Set-Cookie': SESSION_COOKIE + '=' + token +
       '; HttpOnly; Path=/; SameSite=Lax; Max-Age=' + Math.floor(SESSION_TTL / 1000)
   });
@@ -231,11 +212,6 @@ function serveStatic(req, res) {
     urlPath = decodeURIComponent(req.url.split('?')[0]);
   } catch (e) {
     return send(res, 400, 'Bad Request');
-  }
-  // ملفات الخادم والبيانات الداخلية لا تُعرض كملفات عامة.
-  if (urlPath.split('/').some(part => part.startsWith('.')) ||
-      ['/server.js', '/start-server.bat', '/cards.json'].includes(urlPath.toLowerCase())) {
-    return send(res, 404, 'Not Found');
   }
   if (urlPath === '/' ) urlPath = '/' + HOME_PAGE;
 
@@ -300,5 +276,5 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log('✔ خادم أمجد شغّال على  http://localhost:' + PORT + '/');
-  console.log('  اسم حساب الأدمن: admin');
+  console.log('  حساب الأدمن: ' + ADMIN_USER);
 });
